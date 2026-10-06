@@ -1,0 +1,25 @@
+{
+  "description": "Foundational LLM-agent papers. Recent papers build on these constantly but rarely explain them, so they are added by hand to give the corpus its conceptual base. The title is used to verify that each id points at the intended paper.",
+  "papers": [
+    {"arxiv_id": "2201.11903", "year": 2022, "topic": "reasoning", "title": "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"},
+    {"arxiv_id": "2210.03629", "year": 2022, "topic": "reasoning + acting", "title": "ReAct: Synergizing Reasoning and Acting in Language Models"},
+    {"arxiv_id": "2302.04761", "year": 2023, "topic": "tool use", "title": "Toolformer: Language Models Can Teach Themselves to Use Tools"},
+    {"arxiv_id": "2303.11366", "year": 2023, "topic": "self-reflection", "title": "Reflexion: Language Agents with Verbal Reinforcement Learning"},
+    {"arxiv_id": "2303.17651", "year": 2023, "topic": "self-reflection", "title": "Self-Refine: Iterative Refinement with Self-Feedback"},
+    {"arxiv_id": "2303.17580", "year": 2023, "topic": "tool use", "title": "HuggingGPT: Solving AI Tasks with ChatGPT and its Friends in Hugging Face"},
+    {"arxiv_id": "2303.17760", "year": 2023, "topic": "multi-agent", "title": "CAMEL: Communicative Agents for \"Mind\" Exploration of Large Language Model Society"},
+    {"arxiv_id": "2304.03442", "year": 2023, "topic": "memory", "title": "Generative Agents: Interactive Simulacra of Human Behavior"},
+    {"arxiv_id": "2305.10601", "year": 2023, "topic": "planning", "title": "Tree of Thoughts: Deliberate Problem Solving with Large Language Models"},
+    {"arxiv_id": "2305.15334", "year": 2023, "topic": "tool use", "title": "Gorilla: Large Language Model Connected with Massive APIs"},
+    {"arxiv_id": "2305.16291", "year": 2023, "topic": "embodied / lifelong learning", "title": "Voyager: An Open-Ended Embodied Agent with Large Language Models"},
+    {"arxiv_id": "2307.13854", "year": 2023, "topic": "benchmark", "title": "WebArena: A Realistic Web Environment for Building Autonomous Agents"},
+    {"arxiv_id": "2307.16789", "year": 2023, "topic": "tool use", "title": "ToolLLM: Facilitating Large Language Models to Master 16000+ Real-world APIs"},
+    {"arxiv_id": "2308.00352", "year": 2023, "topic": "multi-agent", "title": "MetaGPT: Meta Programming for A Multi-Agent Collaborative Framework"},
+    {"arxiv_id": "2308.03688", "year": 2023, "topic": "benchmark", "title": "AgentBench: Evaluating LLMs as Agents"},
+    {"arxiv_id": "2308.08155", "year": 2023, "topic": "multi-agent", "title": "AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation"},
+    {"arxiv_id": "2308.11432", "year": 2023, "topic": "survey", "title": "A Survey on Large Language Model based Autonomous Agents"},
+    {"arxiv_id": "2309.07864", "year": 2023, "topic": "survey", "title": "The Rise and Potential of Large Language Model Based Agents: A Survey"},
+    {"arxiv_id": "2310.06770", "year": 2023, "topic": "benchmark", "title": "SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"},
+    {"arxiv_id": "2310.08560", "year": 2023, "topic": "memory", "title": "MemGPT: Towards LLMs as Operating Systems"}
+  ]
+}
