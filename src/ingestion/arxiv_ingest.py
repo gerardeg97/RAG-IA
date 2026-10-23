@@ -1,21 +1,25 @@
 """arXiv ingestion -- bronze layer.
 
-Fetches paper metadata from the official arXiv API and stores it as JSON Lines.
+Fetches paper metadata from the official arXiv API and stores it as JSON Lines, then
+downloads the PDF of every stored paper.
 
 Subcommands
 -----------
 count   How many papers match the corpus query, plus a small sample (writes nothing).
 fetch   Fetch the N most recent papers matching the query (the "rolling" corpus).
 seed    Fetch the hand-picked foundational papers listed in config/seed_papers.json.
+pdfs    Download the PDF of every paper in papers.jsonl that is not on disk yet.
 
 Storage layout
 --------------
 data/bronze/arxiv/runs/<run_id>.jsonl      raw records of a single run (immutable, for auditing)
 data/bronze/arxiv/runs/<run_id>.meta.json  run parameters and statistics
 data/bronze/arxiv/papers.jsonl             one record per paper, upserted by arXiv id
+data/bronze/arxiv/pdfs/<id>v<version>.pdf  one PDF per paper, latest stored version only
 
 Every run is idempotent: re-running it never duplicates papers, it only inserts new ones
-or replaces a paper when arXiv publishes a newer version.
+or replaces a paper when arXiv publishes a newer version. 'pdfs' skips files already on
+disk and retries failed downloads on the next run.
 
 Usage (from the project root)
 -----------------------------
@@ -23,6 +27,7 @@ python -m src.ingestion.arxiv_ingest count --sample 10
 python -m src.ingestion.arxiv_ingest fetch --max-results 500
 python -m src.ingestion.arxiv_ingest fetch --incremental          # daily update
 python -m src.ingestion.arxiv_ingest seed
+python -m src.ingestion.arxiv_ingest pdfs --limit 3               # try a few first
 """
 
 from __future__ import annotations
@@ -70,6 +75,11 @@ NUM_RETRIES = 5
 
 # --incremental stops after this many consecutive already-known papers.
 KNOWN_STREAK_LIMIT = 20
+
+# PDF downloads: transient errors are tried at most this many times in a run.
+PDF_DIR_NAME = "pdfs"
+PDF_MAX_ATTEMPTS = 3
+PDF_TIMEOUT_SECONDS = 60
 
 _VERSION_RE = re.compile(r"v(\d+)$")
 
@@ -375,6 +385,158 @@ def cmd_seed(args: argparse.Namespace) -> int:
     return 1 if (missing or rejected) else 0
 
 
+class NotAPdfError(Exception):
+    """The server answered 200 but the body is not a PDF (e.g. an HTML error page)."""
+
+
+class Throttle:
+    """Keeps at least `interval` seconds between the starts of consecutive requests."""
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._last: float | None = None
+
+    def wait(self) -> None:
+        if self._last is not None:
+            remaining = self.interval - (time.monotonic() - self._last)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last = time.monotonic()
+
+
+def is_transient(exc: requests.RequestException) -> bool:
+    """Timeouts, dropped connections, 429 and 5xx may succeed later; other 4xx never will."""
+    status = getattr(exc.response, "status_code", None)
+    return status is None or status == 429 or status >= 500
+
+
+def pdf_filename(paper: dict) -> str:
+    return f"{paper['arxiv_id']}v{paper['version']}.pdf"
+
+
+def download_pdf(url: str, dest: Path) -> int:
+    """Download `url` to `dest` atomically and return its size in bytes.
+
+    The body is streamed into `<dest>.tmp` and only renamed to `dest` once it is complete
+    and looks like a PDF, so an interrupted download never leaves a truncated file behind.
+    """
+    tmp = dest.with_suffix(".pdf.tmp")
+    try:
+        with requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=PDF_TIMEOUT_SECONDS,
+                          stream=True) as resp:
+            resp.raise_for_status()
+            with tmp.open("wb") as fh:
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    fh.write(chunk)
+        with tmp.open("rb") as fh:
+            if fh.read(5) != b"%PDF-":
+                raise NotAPdfError(f"{url} did not return a PDF")
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)  # no-op after a successful rename
+    return dest.stat().st_size
+
+
+def download_with_retries(url: str, dest: Path, throttle: Throttle) -> int:
+    """Retry transient errors up to PDF_MAX_ATTEMPTS times; permanent errors raise at once."""
+    for attempt in range(1, PDF_MAX_ATTEMPTS + 1):
+        throttle.wait()
+        try:
+            return download_pdf(url, dest)
+        except requests.RequestException as exc:
+            if not is_transient(exc) or attempt == PDF_MAX_ATTEMPTS:
+                raise
+            log.warning("  %s: %s. Retry %d/%d", dest.name, exc.__class__.__name__,
+                        attempt, PDF_MAX_ATTEMPTS - 1)
+    raise AssertionError("unreachable")
+
+
+def remove_old_versions(pdf_dir: Path, arxiv_id: str, keep: Path) -> int:
+    """Delete every other version of this paper. Called only after `keep` is safely on disk."""
+    removed = 0
+    for old in pdf_dir.glob(f"{arxiv_id}v*.pdf"):
+        if old != keep:
+            old.unlink()
+            log.info("  removed old version %s", old.name)
+            removed += 1
+    return removed
+
+
+def cmd_pdfs(args: argparse.Namespace) -> int:
+    run_id = new_run_id("pdfs")
+    started = utc_now()
+    store = PaperStore(args.data_dir)
+    pdf_dir = args.data_dir / PDF_DIR_NAME
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    papers = list(store.papers.values())
+    if args.limit is not None:
+        papers = papers[:args.limit]
+    log.info("Checking %d papers against %s", len(papers), pdf_dir)
+
+    records: list[dict] = []
+    transitory_fail: list[str] = []
+    permanent_fail: list[str] = []
+    skipped_existing = removed_old_versions = 0
+    interrupted = False
+    throttle = Throttle(DELAY_SECONDS)
+    try:
+        for i, paper in enumerate(papers, 1):
+            dest = pdf_dir / pdf_filename(paper)
+            if dest.exists():
+                skipped_existing += 1
+                continue
+            try:
+                size = download_with_retries(paper["pdf_url"], dest, throttle)
+            except requests.RequestException as exc:
+                failed = transitory_fail if is_transient(exc) else permanent_fail
+                failed.append(paper["arxiv_id"])
+                log.warning("[%d/%d] %s failed: %s", i, len(papers), dest.name, exc)
+                continue
+            except NotAPdfError as exc:
+                permanent_fail.append(paper["arxiv_id"])
+                log.warning("[%d/%d] %s failed: %s", i, len(papers), dest.name, exc)
+                continue
+            removed_old_versions += remove_old_versions(pdf_dir, paper["arxiv_id"], keep=dest)
+            records.append({
+                "arxiv_id": paper["arxiv_id"],
+                "version": paper["version"],
+                "file": dest.name,
+                "bytes": size,
+                "run_id": run_id,
+                "downloaded_at": utc_now().isoformat(timespec="seconds"),
+            })
+            log.info("[%d/%d] %s (%.1f MB)", i, len(papers), dest.name, size / 1e6)
+    except KeyboardInterrupt:
+        interrupted = True
+        log.warning("Interrupted: keeping the PDFs downloaded so far and writing the run record.")
+
+    write_run(args.data_dir, run_id, records, {
+        "run_id": run_id,
+        "command": "pdfs",
+        "pdf_dir": str(pdf_dir),
+        "limit": args.limit,
+        "requested": len(papers),
+        "downloaded": len(records),
+        "skipped_existing": skipped_existing,
+        "removed_old_versions": removed_old_versions,
+        "transitory_fail": transitory_fail,
+        "permanent_fail": permanent_fail,
+        "interrupted": interrupted,
+        "started_at": started.isoformat(timespec="seconds"),
+        "finished_at": utc_now().isoformat(timespec="seconds"),
+    })
+    log.info("Done: downloaded=%d skipped_existing=%d removed_old_versions=%d "
+             "transitory_fail=%d permanent_fail=%d",
+             len(records), skipped_existing, removed_old_versions,
+             len(transitory_fail), len(permanent_fail))
+    if transitory_fail:
+        log.warning("Transient failures (will be retried next run): %s", ", ".join(transitory_fail))
+    if permanent_fail:
+        log.warning("Permanent failures (will be retried next run): %s", ", ".join(permanent_fail))
+    return 1 if (transitory_fail or permanent_fail or interrupted) else 0
+
+
 # --------------------------------------------------------------------------- CLI
 
 def _date(value: str) -> date:
@@ -387,7 +549,7 @@ def _date(value: str) -> date:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="arxiv_ingest",
-        description="Ingest arXiv paper metadata into the bronze layer.",
+        description="Ingest arXiv paper metadata and PDFs into the bronze layer.",
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                         help=f"bronze output directory (default: {DEFAULT_DATA_DIR.relative_to(PROJECT_ROOT)})")
@@ -415,6 +577,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_seed = sub.add_parser("seed", help="fetch the hand-picked foundational papers")
     p_seed.add_argument("--seed-file", type=Path, default=DEFAULT_SEED_FILE)
     p_seed.set_defaults(func=cmd_seed)
+
+    p_pdfs = sub.add_parser("pdfs", help="download the PDFs of the stored papers")
+    p_pdfs.add_argument("--limit", type=int, help="only check the N most recent stored papers")
+    p_pdfs.set_defaults(func=cmd_pdfs)
     return parser
 
 

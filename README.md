@@ -4,7 +4,7 @@ RAG pipeline for AI research papers — from arXiv ingestion to evaluated retrie
 
 The goal is not another notebook that calls an LLM, but a data-engineering view of RAG: a real ingestion pipeline, incremental updates, quantitative evaluation and deployment.
 
-> **Status:** Phase 1 in progress — arXiv metadata ingestion is implemented (`src/ingestion/arxiv_ingest.py`).
+> **Status:** Phase 1 in progress — arXiv metadata and PDF ingestion are implemented (`src/ingestion/arxiv_ingest.py`). The bronze layer holds **520 papers** (500 recent, submitted 26 Sep – 5 Oct 2026, plus 20 seed papers) and their **520 PDFs** (1.6 GB). Next: text extraction (silver).
 
 ---
 
@@ -83,7 +83,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### Ingestion (arXiv metadata)
+### Ingestion (arXiv metadata and PDFs)
 
 Run from the project root:
 
@@ -97,25 +97,38 @@ python -m src.ingestion.arxiv_ingest fetch
 # 3. Foundational papers
 python -m src.ingestion.arxiv_ingest seed
 
-# 4. Daily update: stops after 20 consecutive papers already stored
+# 4. PDFs of every stored paper (try a few first with --limit 3)
+python -m src.ingestion.arxiv_ingest pdfs
+
+# 5. Daily update: stops after 20 consecutive papers already stored, then fetch their PDFs
 python -m src.ingestion.arxiv_ingest fetch --incremental
+python -m src.ingestion.arxiv_ingest pdfs
 ```
 
 Useful options: `--max-results N`, `--since YYYY-MM-DD`, `--until YYYY-MM-DD`, `--query "<arXiv query>"`, `--log-level DEBUG`.
 
 The client respects arXiv's API guidelines: pages of 100 results, at least 3 seconds between requests, and retries on failure. If the API fails mid-run, the results fetched so far are kept.
 
+`pdfs` downloads one PDF per paper, at least 3 seconds apart (about 30 minutes for the full corpus):
+
+- **Skips** papers whose PDF for the stored version is already on disk, so it can be stopped and resumed at any time.
+- **Atomic writes:** each file is streamed to `<name>.pdf.tmp` and only renamed once complete and checked to start with `%PDF-`, so an interrupted run never leaves a truncated PDF.
+- **New versions:** when a paper gets a new version, the new PDF is downloaded first and the old one is deleted only afterwards.
+- **Failures** never stop the run. Transient errors (timeouts, dropped connections, HTTP 429/5xx) are tried up to 3 times; permanent ones (other 4xx, non-PDF responses) are not. Both are listed in the run's `.meta.json` (`transitory_fail`, `permanent_fail`) and retried on the next run.
+
 ### Data layout
 
 ```text
 data/bronze/arxiv/
 ├── papers.jsonl                 # one record per paper, upserted by arXiv id
+├── pdfs/
+│   └── <arxiv_id>v<version>.pdf # latest stored version of each paper
 └── runs/
     ├── <run_id>.jsonl           # raw records of one run (immutable, for auditing)
-    └── <run_id>.meta.json       # query, parameters, inserted/updated/unchanged counts
+    └── <run_id>.meta.json       # parameters and counts (inserted/updated/unchanged, downloaded/failed)
 ```
 
-Runs are **idempotent**: running the same command twice never duplicates papers. A paper is only replaced when arXiv publishes a newer version, and its `first_ingested_at` is preserved. `data/` is git-ignored.
+Runs are **idempotent**: running the same command twice never duplicates papers or PDFs. A paper is only replaced when arXiv publishes a newer version, and its `first_ingested_at` is preserved. `data/` is git-ignored.
 
 Main fields of each record:
 
@@ -136,7 +149,7 @@ Main fields of each record:
 | Phase | Content | Status |
 |---|---|---|
 | 0 | Domain and corpus definition | ✅ done |
-| 1 | Ingestion: arXiv metadata (bronze) → PDF download → text extraction (silver) | 🟡 metadata done |
+| 1 | Ingestion: arXiv metadata (bronze) → PDF download → text extraction (silver) | 🟡 metadata and PDFs done |
 | 2 | Chunking and embeddings; chunk-size experiment (256 / 512 / 1024 tokens) | ⬜ |
 | 3 | Orchestration as a DAG (`fetch → clean → chunk → embed → load`), incremental updates | ⬜ |
 | 4 | Retrieval + generation behind a FastAPI `/query` endpoint, with source citations | ⬜ |
